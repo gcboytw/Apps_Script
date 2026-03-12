@@ -1,0 +1,295 @@
+// --- 個人設定區 ---
+const TELEGRAM_TOKEN = "8135191305:AAFDCSaXyy4ff_RgiKWEr6SBcmBaIplvD50"; // 貼上 BotFather 給你的 Token
+const TELEGRAM_CHAT_ID = "991807108";     // 貼上你的 Chat ID
+const EMAIL_RECIPIENT = "gcboy.tw@gmail.com"; // 你的收件信箱
+const SHEET_NAME = "股價追蹤";                // 確保分頁名稱正確
+const FUGLE_TOKEN = "Y2FiM2VhNjItYjMzMC00YTYyLWE2MGQtNjNhZTc1YTIzMmRiIDRkZDgzY2ZlLTFjZWEtNDY3NC1hNjI0LWFhMGNjNTlkZTJiOQ=="; // 富果 (Fugle) API Token
+// ----------------
+
+function updateAndCheckStocks() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(SHEET_NAME);
+  if (!sheet) return;
+
+  const now = new Date();
+  const day = now.getDay(); 
+  const hour = now.getHours();
+  const minute = now.getMinutes();
+  const currentTime = hour * 100 + minute;
+
+  // --- 1. 台股開盤時間判斷 (週一至週五 09:00 - 13:40) ---
+  // 測試時若在非交易時段，請將下面這兩段 if 暫時加上註解 //
+  if (day === 0 || day === 6) {
+    console.log("今日為週末，不執行監控。");
+    return;
+  }
+  if (currentTime < 900 || currentTime > 1340) {
+    console.log("非交易時段 (09:00 - 13:40)，不執行監控。");
+    return;
+  }
+
+  // --- 2. 準備執行環境 ---
+  const formattedTime = Utilities.formatDate(now, "GMT+8", "yyyy-MM-dd HH:mm:ss");
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return;
+  const dataRange = sheet.getRange(2, 1, lastRow - 1, 7); // 擴增為 7 欄，包含前一日收盤價
+  const data = dataRange.getValues();
+
+  // --- 3. 逐一抓取股價 (Yahoo 方案) ---
+  for (let i = 0; i < data.length; i++) {
+    let stockId = String(data[i][0]).trim();
+    let stockName = data[i][1];
+    let buyTarget = data[i][4];    // E 欄：買進價 (原為 D)
+    let sellTarget = data[i][5];   // F 欄：賣出價 (原為 E)
+    let status = data[i][6];       // G 欄：通知狀態 (原為 F)
+
+
+    if (!stockId) continue;
+
+    // 優先使用富果 (Fugle) 即時報價，失敗轉 TWSE，最後使用 Yahoo (備援)
+    let priceData = getPriceFromFugle(stockId);
+    if (!priceData || priceData.price === 0) {
+      console.log(`Fugle 取價失敗，轉用 TWSE: ${stockId}`);
+      priceData = getPriceFromTwse(stockId);
+      if (!priceData || priceData.price === 0) {
+        console.log(`TWSE 取價失敗，轉用 Yahoo: ${stockId}`);
+        priceData = getPriceFromYahoo(stockId);
+      }
+    }
+
+    let currentPrice = priceData.price || 0;
+    let prevClose = priceData.prevClose || 0;
+
+    if (currentPrice > 0 || prevClose > 0) {
+      // 更新 C 欄股價
+      if (currentPrice > 0) sheet.getRange(i + 2, 3).setValue(currentPrice);
+
+      // 更新 D 欄前一日收盤價
+      if (prevClose > 0) sheet.getRange(i + 2, 4).setValue(prevClose);
+
+      // 4. 判斷達標
+      if (currentPrice > 0 && status !== "已通知") {
+      let triggered = false;
+      let msgTitle = "";
+
+      // 買進判定
+      if (buyTarget > 0 && currentPrice <= buyTarget) {
+        msgTitle = `🚨 【買進(停利)提醒】${stockName} (${stockId})`;
+        triggered = true;
+      } 
+      // 賣出判定
+      else if (sellTarget > 0 && currentPrice >= sellTarget) {
+        msgTitle = `💰 【賣出提醒】${stockName} (${stockId})`;
+        triggered = true;
+      }
+
+      if (triggered) {
+        let msgBody = `目前股價：${currentPrice}\n昨日收盤：${prevClose}\n時間：${formattedTime}`;
+        sendTelegram(msgTitle + "\n" + msgBody);
+        MailApp.sendEmail(EMAIL_RECIPIENT, msgTitle, msgBody);
+
+        // 更新 G 欄位 (第 7 欄) 為已通知
+          sheet.getRange(i + 2, 7).setValue("已通知");
+        }
+    }
+//      if (currentPrice <= targetPrice && status !== "已通知") {
+//        let msgTitle = `🚨 【買進提醒】${stockName} (${stockId})`;
+//        let msgBody = `目前股價：${currentPrice}\n預計買進：${targetPrice}\n時間：${formattedTime}`;
+//        
+//        sendTelegram(msgTitle + "\n" + msgBody);
+//        MailApp.sendEmail(EMAIL_RECIPIENT, msgTitle, msgBody);
+//        
+//        sheet.getRange(i + 2, 5).setValue("已通知");
+//      }
+    }
+    // 每次抓取間隔 1.5 秒，保持穩定
+    Utilities.sleep(1500);
+  }
+
+  // 更新 H1 最後檢查時間與 Z1 隨機數
+  sheet.getRange("H1").setValue(formattedTime);
+  sheet.getRange("Z1").setValue(now.getTime());
+}
+
+// 富果 (Fugle) API 報價函式
+function getPriceFromFugle(stockId) {
+  try {
+    const url = `https://api.fugle.tw/marketdata/v1.0/stock/intraday/quote/${stockId}`;
+    const options = {
+      "method": "get",
+      "headers": {
+        "X-API-KEY": FUGLE_TOKEN
+      },
+      "muteHttpExceptions": true
+    };
+    
+    const response = UrlFetchApp.fetch(url, options);
+    const json = JSON.parse(response.getContentText());
+    
+    // 判斷回傳資料中是否有最新收盤價/成交價
+    if (json && json.date && json.lastPrice) {
+       return {
+         price: parseFloat(json.lastPrice),
+         prevClose: parseFloat(json.previousClose) || 0
+       };
+    }
+  } catch (e) {
+    console.warn(`Fugle 嘗試 ${stockId} 失敗: ${e}`);
+  }
+  return { price: 0, prevClose: 0 };
+}
+
+// Yahoo API 專用抓取函式 (含資料時間檢查)
+function getPriceFromYahoo(stockId) {
+  const suffixes = [".TW", ".TWO"]; 
+  const now = new Date();
+
+  for (let suffix of suffixes) {
+    try {
+      let url = `https://query1.finance.yahoo.com/v8/finance/chart/${stockId}${suffix}`;
+      let response = UrlFetchApp.fetch(url, { "muteHttpExceptions": true });
+      let json = JSON.parse(response.getContentText());
+      
+      if (json.chart && json.chart.result && json.chart.result[0].meta) {
+        let meta = json.chart.result[0].meta;
+        let price = meta.regularMarketPrice || 0;
+        let time = meta.regularMarketTime;
+        let prevClose = meta.chartPreviousClose || meta.previousClose || 0;
+
+        // 資料時間檢查：若資料時間落後現在超過 18 小時，視為昨日收盤價 (無效)
+        if (time) {
+          let dataTime = new Date(time * 1000);
+          let diffHours = (now - dataTime) / (1000 * 60 * 60);
+          if (diffHours > 18) {
+            console.log(`${stockId}${suffix} 資料過期 (${dataTime})，忽略。`);
+            continue;
+          }
+        }
+
+        if (price > 0 || prevClose > 0) return { price: price, prevClose: prevClose };
+      }
+    } catch (e) {
+      console.error(`Yahoo 嘗試 ${stockId}${suffix} 失敗`);
+    }
+  }
+  return { price: 0, prevClose: 0 };
+}
+
+// 證交所 (TWSE) 即時報價函式 (含重試機制)
+function getPriceFromTwse(stockId) {
+  const maxRetries = 3;
+  // 迴圈嘗試 maxRetries 次
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      // 查詢上市與上櫃 (tse & otc)
+      // 加上時間戳記避免快取，且必須將 '|' 編碼為 '%7C' 避免 UrlFetchApp 報錯
+      var url = `https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_${stockId}.tw%7Cotc_${stockId}.tw&json=1&delay=0&_=${new Date().getTime()}`;
+      var response = UrlFetchApp.fetch(url, { "muteHttpExceptions": true });
+      var json = JSON.parse(response.getContentText());
+
+      if (json.msgArray && json.msgArray.length > 0) {
+        for (var i = 0; i < json.msgArray.length; i++) {
+          var stock = json.msgArray[i];
+          if (stock.c !== stockId) continue; // 確保代號相符
+
+          // 抓取昨日收盤價
+          let prevClose = stock.y && stock.y !== "-" ? parseFloat(stock.y) : 0;
+          let currentPrice = 0;
+
+          // 優先取最近成交價 (z)
+          if (stock.z && stock.z !== "-") {
+            currentPrice = parseFloat(stock.z);
+          }
+          // 若 z 為 "-" (例如剛開盤或無成交但有掛單)，改抓買進價 (b) 或賣出價 (a)
+          else if (stock.b && stock.b !== "-") {
+            let bids = stock.b.split("_");
+            if (bids.length > 0 && bids[0]) currentPrice = parseFloat(bids[0]);
+          }
+          else if (stock.a && stock.a !== "-") {
+            let asks = stock.a.split("_");
+            if (asks.length > 0 && asks[0]) currentPrice = parseFloat(asks[0]);
+          }
+
+          if (currentPrice > 0 || prevClose > 0) {
+            return { price: currentPrice, prevClose: prevClose };
+          }
+        }
+      }
+      // 如果執行到這裡沒有錯誤但也沒有回傳，通常是該次 request 沒抓到正確資料，可以視為失敗
+      // 這裡選擇若成功解析但沒資料就不重試了，直接 return 交給 Yahoo
+      break; 
+
+    } catch (e) {
+      console.warn(`TWSE 嘗試 ${stockId} 第 ${attempt} 次失敗: ${e}`);
+      if (attempt < maxRetries) {
+        Utilities.sleep(1000); // 失敗後暫停 1 秒再重試
+      } else {
+        console.error(`TWSE ${stockId} 最終失敗。`);
+      }
+    }
+  }
+  return { price: 0, prevClose: 0 }; 
+}
+
+// Telegram 發送函式
+function sendTelegram(message) {
+  try {
+    const url = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`;
+    UrlFetchApp.fetch(url, {
+      "method": "post",
+      "contentType": "application/json",
+      "payload": JSON.stringify({ "chat_id": TELEGRAM_CHAT_ID, "text": message })
+    });
+  } catch(e) { console.error("Telegram 發送失敗"); }
+}
+
+// 每日重置通知狀態 (建議設定每天早上 8:30 的觸發器)
+function resetDailyStatus() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(SHEET_NAME);
+  const lastRow = sheet.getLastRow();
+  // 配合新增了前一日收盤價 (原本第 6 欄變為第 7 欄 G 欄)
+  if (lastRow >= 2) sheet.getRange(2, 7, lastRow - 1, 1).clearContent();
+}
+
+// 這個函式是用來「預約」今天中午 12:50 的重置動作
+function createNoonTrigger() {
+  // 先清除舊的 12:50 觸發器，避免重複執行
+  deleteTriggerByName("resetDailyStatusAtNoon");
+
+  // 設定今天的 12:50
+  var noon = new Date();
+  noon.setHours(12);
+  noon.setMinutes(50);
+  noon.setSeconds(0);
+
+  // 如果現在已經超過 12:10，就設定明天的
+  if (new Date() > noon) {
+    noon.setDate(noon.getDate() + 1);
+  }
+
+  // 建立一次性觸發器
+  ScriptApp.newTrigger("resetDailyStatusAtNoon")
+    .timeBased()
+    .at(noon)
+    .create();
+  
+  console.log("已預約下一次精確重置時間：" + noon);
+}
+
+// 這是被觸發器執行的實際內容
+function resetDailyStatusAtNoon() {
+  resetDailyStatus(); // 執行原本的重置邏輯
+  // 執行完後，可以再預約明天的時間（選擇性）
+  createNoonTrigger();
+}
+
+// 輔助函式：刪除重複的觸發器
+function deleteTriggerByName(functionName) {
+  var triggers = ScriptApp.getProjectTriggers();
+  for (var i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === functionName) {
+      ScriptApp.deleteTrigger(triggers[i]);
+    }
+  }
+}
