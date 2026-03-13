@@ -1,0 +1,142 @@
+/**
+ * Google Sheet News Search Script
+ * 
+ * 功能：
+ * 1. 讀取「News」分頁 A 欄 (股票代碼) 與 B 欄 (股票名稱)。
+ * 2. 針對每一列的標的，搜尋 Google News RSS。
+ * 3. 將搜尋結果寫入 C 欄至 G 欄 (股票代碼, 股票名稱, 發佈時間, 新聞標題, 新聞連結)。
+ * 4. 每次執行前會清除 C2:G 的舊資料。
+ * 
+ * 使用說明 - 建立按鈕：
+ * 1. 在 Google Sheet 中，點擊「插入」>「繪圖」。
+ * 2. 畫一個矩形或按鈕形狀，輸入文字「執行新聞搜尋」。
+ * 3. 儲存並關閉。
+ * 4. 將圖片移動到 A25 儲存格附近。
+ * 5. 點擊圖片右上角的選單 (三個點) >「指派指令碼」。
+ * 6. 輸入函式名稱：fetchStockNews
+ */
+
+function fetchStockNews() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const newsSheet = ss.getSheetByName("News");
+  
+  if (!newsSheet) {
+    SpreadsheetApp.getUi().alert("找不到名為 'News' 的分頁，請先建立。");
+    return;
+  }
+
+  // 1. 取得要追蹤的股票清單 (從 News 分頁的 A 欄與 B 欄，從第 2 列開始)
+  // 顯示開始訊息 (讓按鈕有點反應)
+  ss.toast("正在搜尋股票新聞...", "請稍候", -1);
+
+  // A欄: 股票代碼, B欄: 股票名稱
+  const lastRow = newsSheet.getLastRow();
+  // 如果沒有資料或是只有標題列，則不執行
+  if (lastRow < 2) {
+    SpreadsheetApp.getUi().alert("請在 A 欄與 B 欄輸入欲追蹤的股票代碼與名稱 (從第 2 列開始)。");
+    return;
+  }
+
+  // 讀取 A2:B(lastRow)
+  const stocks = newsSheet.getRange(2, 1, lastRow - 1, 2).getValues();
+
+  // 2. 清除舊資料：清除 C2:G 的所有內容
+  const maxRows = newsSheet.getMaxRows();
+  if (maxRows > 1) {
+    newsSheet.getRange(2, 3, maxRows - 1, 5).clearContent();
+  }
+  // 強制更新 UI，讓使用者看到舊資料被清除
+  SpreadsheetApp.flush();
+
+  let allNewsData = [];
+
+  stocks.forEach(row => {
+    let stockId = String(row[0]).trim();
+    let stockName = String(row[1]).trim();
+    
+    // 如果代碼或名稱為空，跳過
+    if (!stockId || !stockName) return;
+
+    // 3. 構建 Google News RSS URL
+    // 搜尋關鍵字：代碼 + 名稱 + 30天內
+    const query = `${stockId} ${stockName} when:30d`;
+    const encodedQuery = encodeURIComponent(query);
+    // 加入時間戳記參數 t 來避免 Google 快取舊的 RSS 結果
+    const rssUrl = `https://news.google.com/rss/search?q=${encodedQuery}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant&t=${new Date().getTime()}`;
+    
+    try {
+      const response = UrlFetchApp.fetch(rssUrl);
+      const xml = response.getContentText();
+      const document = XmlService.parse(xml);
+      const root = document.getRootElement();
+      const channel = root.getChild("channel");
+      const items = channel.getChildren("item");
+
+      let stockNewsItems = [];
+      
+      const parsedItems = items.map(item => {
+        const title = item.getChildText("title");
+        const link = item.getChildText("link");
+        const pubDateStr = item.getChildText("pubDate");
+        
+        return {
+          title: title,
+          link: link,
+          pubDate: new Date(pubDateStr)
+        };
+      });
+
+      // 依照日期排序 (新到舊)
+      parsedItems.sort((a, b) => b.pubDate - a.pubDate);
+
+      // 4. 篩選邏輯
+      // 計算今日已發布的新聞數量
+      const todayStr = Utilities.formatDate(new Date(), "GMT+8", "yyyy-MM-dd");
+      const todayCount = parsedItems.filter(item => 
+        Utilities.formatDate(item.pubDate, "GMT+8", "yyyy-MM-dd") === todayStr
+      ).length;
+
+      // 決定顯示數量：若今日新聞 >= 10 則顯示 10 則，否則顯示最新 5 則
+      const limit = (todayCount >= 10) ? 10 : 5;
+      const finalItems = parsedItems.slice(0, limit);
+
+      // 將選定的新聞加入總列表
+      for (let item of finalItems) {
+        let formattedDate = Utilities.formatDate(item.pubDate, "GMT+8", "yyyy-MM-dd HH:mm");
+        // 格式：[股票代碼, 股票名稱, 發佈時間, 新聞標題, 新聞連結]
+        // 對應欄位：C, D, E, F, G
+        allNewsData.push([stockId, stockName, formattedDate, item.title, item.link]);
+      }
+      
+      console.log(`${stockName} 抓取到 ${finalItems.length} 則新新聞`);
+
+    } catch (e) {
+      console.error(`無法取得 ${stockId} 的新聞: ${e.message}`);
+      // 可以選擇是否要將錯誤訊息填入儲存格，目前僅 log
+    }
+    
+    // 稍微休息，避免請求過快
+    Utilities.sleep(500);
+  });
+
+  // 5. 一次性寫入所有資料到 C 欄開始的位置
+  if (allNewsData.length > 0) {
+    // 檢查是否有足夠的列數，若不足則新增
+    const currentMaxRows = newsSheet.getMaxRows();
+    const requiredRows = allNewsData.length + 1; // +1 是因為有標題列
+    if (requiredRows > currentMaxRows) {
+      newsSheet.insertRowsAfter(currentMaxRows, requiredRows - currentMaxRows);
+    }
+
+    // 從 C2 開始寫入
+    // getRange(row, column, numRows, numColumns)
+    // row=2, column=3 (C欄)
+    newsSheet.getRange(2, 3, allNewsData.length, 5).setValues(allNewsData);
+    
+    // 顯示完成訊息
+    ss.toast(`已更新 ${allNewsData.length} 則新聞`, "完成", 5);
+  } else {
+    // 如果沒有任何新聞
+    ss.toast("沒有找到相關新聞", "完成", 5);
+  }
+}
